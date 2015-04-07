@@ -1,0 +1,8 @@
+Files:	pidfile.c
+	region_locking.c
+
+The code is these files is based on that published in The Linux Programming Interface by Michael Kerrick, 2010
+
+License:
+
+The source code file is copyright 2010, Michael Kerrisk, and is licensed under the GNU Lesser General Public License, version 3.

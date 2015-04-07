@@ -14,7 +14,7 @@
 #define TRUE	1
 #define FALSE	0
 #define VERSION "1.10"
-#define HOSTNAME "vpn.wsadmin.org"
+#define HOSTNAME "example.org"
 
 struct ValidIP {
   uint32_t	ipAddr;

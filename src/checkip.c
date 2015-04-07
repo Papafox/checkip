@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     struct mg_server *server;
     char  buf[100];
     const char* pidFile = "/var/run/checkip.pid";
-    char* port = "80,ssl://443:checkip-cert.pem";
+    char* port = "80,ssl://443:server-cert.pem";
     char* user = "nobody";
     int jail_mode = FALSE;
     char* jail_root = NULL;

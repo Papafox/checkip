@@ -41,3 +41,6 @@ checkip -d -p nnn -j /path/to/chroot -u userid
 	The file `server-ceret.pem` must contain both the x509 certificate and the private key.
 
 
+## Dependencies
+
+To install checkip, you will require the OpenSSL libraries

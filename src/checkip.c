@@ -413,19 +413,6 @@ int main(int argc, char** argv) {
     // lock the pid file
     createPidFile(argv[0], pidFile, 0);
 
-    // chroot jail the process
-    if (jail_mode && !isChrooted()) {
-       // adjust the path
-       putenv("PATH=/bin:/sbin");
-
-       // set the new root dir
-       int err = chroot(jail_root);
-       if (err != 0) {
-          log_msg(daemon_mode, "chroot() failed! (err %d) - exiting", err);
-          exit(-1);
-       }
-    }
-
     // If a daemon, fork a child process and exit the parent
     if (daemon_mode) {
       // 1. create a child process
@@ -459,24 +446,36 @@ int main(int argc, char** argv) {
     log_msg(daemon_mode, "CheckIP version %s starting", VERSION);
     server = mg_create_server(NULL, ev_handler);
     mg_set_option(server, "listening_port", port);
-    mg_set_option(server, "run_as_user", user);
-    strcpy(buf, mg_get_option(server, "listening_port"));
     if (buf[0] == '\0') {
        log_msg(daemon_mode, "open listening ports failed - exiting");
        goto exit;
     }
-    log_msg(daemon_mode, "Listening on port %s", buf);
+
+    // chroot jail the process
+    if (jail_mode && !isChrooted()) {
+       // adjust the path
+       putenv("PATH=/bin:/sbin");
+
+       // set the new root dir
+       int err = chroot(jail_root);
+       if (err != 0) {
+          log_msg(daemon_mode, "chroot() failed! (err %d) - exiting", errno);
+          exit(-1);
+       }
+       log_msg(daemon_mode, "Established chroot() jail under '%s'", jail_root);
+    }
 
     // Trap KILL's - cause 'running' flag to be set false
+    running = -1;
     signal(SIGINT, intHandler);
     signal(SIGTERM, intHandler);
 
     // Serve request. Hit Ctrl-C or SIGTERM to terminate the program
-    if (jail_mode)
-      log_msg(daemon_mode, "Established chroot() jail under '%s'", jail_root);
+    mg_set_option(server, "run_as_user", user);
     if (user != NULL)
       log_msg(daemon_mode, "Server executing as user '%s'", user);
-    running = -1;
+    strcpy(buf, mg_get_option(server, "listening_port"));
+    log_msg(daemon_mode, "Listening on port %s", buf);
 
     while (running) {
       mg_poll_server(server, 250);

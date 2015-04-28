@@ -1,13 +1,3 @@
-/*************************************************************************\
-*                  Copyright (C) Matthew Donald, 2015.                    *
-*                                                                         *
-* This program is free software. You may use, modify, and redistribute it *
-* under the terms of the GNU Lesser General Public License as published   *
-* by the Free Software Foundation, either version 3 or (at your option)   *
-* any later version. This program is distributed without any warranty.    *
-* See the files COPYING.lgpl-v3 and COPYING.gpl-v3 for details.           *
-**************************************************************************/
-
 #include <stdio.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -38,7 +28,10 @@ static bool isLogable(struct mg_connection *conn) {
     const char* referer = getHeader(conn, "Referer");
     const char* host = getHeader(conn, "Host");
     uint32_t ip = parseIPV4string(remote_ip);
-    return (host == NULL || referer != NULL || (ip >= first_addr && ip <= last_addr));
+
+    bool result = (host == NULL || referer != NULL) && strcmp(conn->uri,"/favicon.ico") != 0;
+    result |= ip >= first_addr && ip <= last_addr;
+    return result;
 }
 
 static void logGoogle(struct mg_connection *conn) {
@@ -82,6 +75,8 @@ static int updateCnt(const char* uri, struct ValidIP* ip, int rc) {
       if (count > -1) {
         count += (strstr(uri, "://") == NULL) ? 2 : 10;
       }
+      // don't increment count for favicon.ico
+      count -= (strcmp(uri, "/favicon.ico") == 0) ? 2 : 0;
     }
     return count;
 }
@@ -104,39 +99,48 @@ static bool isValidReq(struct mg_connection *conn) {
     return TRUE;
 }
 
-static void checkip_req(struct mg_connection *conn) {
-
+static void send_headers(struct mg_connection *conn) {
     // Prevent proxies and browsers from caching response, also include some security headers
     mg_send_header(conn, "Cache-Control", "max-age=0, post-check=0, pre-check=0, no-store, no-cache, must-revalidate");
     mg_send_header(conn, "Pragma", "no-cache");
-    mg_send_header(conn, "Content-Type", "text/html");
+    mg_send_header(conn, "Content-Type", "text/html; charset=utf8");
     mg_send_header(conn, "X-Frame-Options", "DENY");
-    mg_send_header(conn, "X-Content-Type-Options", "nosniff");
     mg_send_header(conn, "Server", "wsadmin-CheckIP/" VERSION);
+}
+
+static void checkip_req(struct mg_connection *conn) {
+    send_headers(conn);
 
     // Return the remote ipaddr
-    mg_printf_data(conn, "<html><head><title>Current IP Check</title></head><body>Current IP Address: %s</body></html>", conn->remote_ip);
+    char resp[200];
+    snprintf(resp, 200, "<html><head><meta name=\"robots\" content=\"noindex\"/><title>Current IP Check</title></head><body>Current IP Address: %s</body></html>", conn->remote_ip);
+    int len = strlen(resp);
+    char lenStr[10];
+    snprintf(lenStr, 10, "%d", len);
+    mg_send_header(conn, "Content-Length", lenStr);
+
+    mg_printf_data(conn, resp);
 }
 
 static void reject_req(struct mg_connection *conn) {
-
-    // Prevent proxies and browsers from caching response, also include some security headers
-    mg_send_header(conn, "Cache-Control", "max-age=0, post-check=0, pre-check=0, no-store, no-cache, must-revalidate");
-    mg_send_header(conn, "Pragma", "no-cache");
-    mg_send_header(conn, "Content-Type", "text/html");
-    mg_send_header(conn, "X-Frame-Options", "DENY");
-    mg_send_header(conn, "X-Content-Type-Options", "nosniff");
-    mg_send_header(conn, "Server", "wsadmin-CheckIP/" VERSION);
+    send_headers(conn);
 
     // Return a please go away message
-    if (strstr(conn->uri, "://") == NULL)
-      mg_printf_data(conn, "<html><head><title>Page not found</title></head><body><p>This page you requested '%s' does not exist</p></body></html>", conn->uri);
-    else
-      mg_printf_data(conn, "<html><head><title>This is not a proxy</title></head><body><p>This is not an open proxy. Your IP address %s has been banned</p></body></html>", conn->remote_ip);
+    char* resp = (strstr(conn->uri, "://") == NULL)?
+                    "<html><head><title>Page not found</title></head><body><p>This page you requested '%s' does not exist</p></body></html>"
+               :    "<html><head><title>This is not a proxy</title></head><body><p>This is not an open proxy. Your IP address %s has been banned</p></body></html>";
+    // Compute a message len and return a Content-Length header
+    int len = strlen(resp);
+    char lenStr[10];
+    snprintf(lenStr, 10, "%d", len);
+    mg_send_header(conn, "Content-Length", lenStr);
+
+    // Return the rejection message
+    mg_printf_data(conn, resp, conn->uri);
 }
 
 static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
-  int result;
+  int result = 404;
   struct ValidIP* ip;
 
   switch (ev) {
@@ -161,10 +165,8 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
 //        ping_req(conn);
 //        result = 200;
 //      }
-      } else {
+      } else
         reject_req(conn);
-        result = 404;
-      }
 
       // update the ban count and possibly ban the ip addr
       ip->count = updateCnt(conn->uri, ip, result);
@@ -182,7 +184,7 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
       );
 
       // if necessary, ban the IP address
-      if (ip->count >= LIMIT) {
+      if (ip->count >= LIMIT || strcmp(conn->request_method, "GET") != 0) {
         banIP(ip, conn->remote_ip);
       }
       return (result == 200) ? MG_TRUE : MG_FALSE;
@@ -280,15 +282,20 @@ static uint32_t parseIPV4string(const char* ipAddress) {
 }
 
 static void banIP(struct ValidIP* ip, const char* ipaddr) {
-    char buf[100];
-
     ip->count = -1;
     ip->ipAddr = 0xffffffff;
     knownCnt--;
 
-    sprintf(buf, "/sbin/iptables -I INPUT -s %s -j DROP", ipaddr);
-    int rc = system(buf);
-    log_msg(daemon_mode, "IP address %s banned - '%s' (rc = %d, errno = %d)", ipaddr, buf, rc, errno);
+    log_msg(daemon_mode, "IP address %s banned - '%s'", ipaddr);
+//    int process_id = fork();
+//    if (process_id < 0) {
+//        log_msg(daemon_mode, "iptables fork() failed! - exiting");
+//    }
+//    if (process_id != 0)
+//        return;
+//    int rc = execl("/sbin/iptables", "-I", "-s", ipaddr, "-j", "DROP", (char *)0);
+//    log_msg(daemon_mode, "iptables exec() failed (ip = %s rc = %d, errno = %d err = '%s')", ipaddr, rc, errno, strerror(rc));
+//    exit(0);
 }
 
 static void redir2null(FILE* oldfile, int oflags) {
@@ -343,7 +350,7 @@ int main(int argc, char** argv) {
     struct mg_server *server;
     char  buf[100];
     const char* pidFile = "/var/run/checkip.pid";
-    char* port = "80,ssl://443:server-cert.pem";
+    char* port = "80,ssl://0.0.0.0:443:checkip-cert.pem";
     char* user = "nobody";
     int jail_mode = FALSE;
     char* jail_root = NULL;
@@ -399,6 +406,10 @@ int main(int argc, char** argv) {
       return -1;
     }
 
+    // Open the log
+    if (daemon_mode)
+      openlog(NULL, LOG_CONS | LOG_PID, LOG_DAEMON);
+
     // lock the pid file
     createPidFile(argv[0], pidFile, 0);
 
@@ -445,6 +456,7 @@ int main(int argc, char** argv) {
     }
 
     // Create and configure the server
+    log_msg(daemon_mode, "CheckIP version %s starting", VERSION);
     server = mg_create_server(NULL, ev_handler);
     mg_set_option(server, "listening_port", port);
     mg_set_option(server, "run_as_user", user);
@@ -453,13 +465,13 @@ int main(int argc, char** argv) {
        log_msg(daemon_mode, "open listening ports failed - exiting");
        goto exit;
     }
+    log_msg(daemon_mode, "Listening on port %s", buf);
 
     // Trap KILL's - cause 'running' flag to be set false
     signal(SIGINT, intHandler);
     signal(SIGTERM, intHandler);
 
     // Serve request. Hit Ctrl-C or SIGTERM to terminate the program
-    log_msg(daemon_mode, "[%d] CheckIP version %s starting on port %s", getpid(), VERSION, buf);
     if (jail_mode)
       log_msg(daemon_mode, "Established chroot() jail under '%s'", jail_root);
     if (user != NULL)
@@ -467,7 +479,7 @@ int main(int argc, char** argv) {
     running = -1;
 
     while (running) {
-      mg_poll_server(server, 100);
+      mg_poll_server(server, 250);
     }
 
     // Get the finish time and compute the duration

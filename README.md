@@ -24,23 +24,25 @@ It serves this page blazingly fast - with a response time of under 10mS. This me
 
 ## Options
 
-checkip -d -p nnn -j /path/to/chroot -u userid
+`checkip -d -p nnn -j /path/to/chroot -u userid`
 
-  -d	Run as daemon
+  -d    Run as daemon
 
-  -j /path/to/chroot
-	Checkip with run in a chroot jail, with the new root set to`/path/to/chroot`
+  -j /path/to/chroot<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Checkip with run in a chroot jail, with the new root set to`/path/to/chroot`
 
-  -u userid
-	Run as userid.  The default is user nobody
+  -u userid<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Run as userid.  The default is user nobody
 
-  -p <port list>
-        List on the following ports.  Checkip uses a mongoose style for ports.  The default is
-	`80,ssl://443:server-cert.pem`, which will listen using http on port 80 and https on 443.
+  -p &lt;port list&gt;<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;List on the following ports.  Checkip uses a mongoose style for ports.
 
-	The file `server-ceret.pem` must contain both the x509 certificate and the private key.
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;The default is `80,ssl://443:server-cert.pem`, which will listen using http on port 80 and https on 443.
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;The file `server-ceret.pem` must contain both the x509 certificate and the private key.
 
 
 ## Dependencies
 
 To install checkip, you will require the OpenSSL libraries
+

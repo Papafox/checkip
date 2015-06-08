@@ -15,9 +15,13 @@
 #ifndef PIDFILE_H   /* Prevent accidental double inclusion */
 #define PIDFILE_H
 
+#include <sys/types.h>
+
 #define CPF_CLOEXEC 1
 
 int createPidFile(const char *progName, const char *pidFile, int flags);
+
+int lockRegion(int fd, int type, int whence, int start, int len);
 
 #endif
 

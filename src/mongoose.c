@@ -15,17 +15,14 @@
 // Alternatively, you can license this library under a commercial
 // license, as set out in <http://cesanta.com/>.
 
-#define MONGOOSE_NO_FILESYSTEM
-#define MONGOOSE_NO_DIRECTORY_LISTING
+//#define MONGOOSE_NO_FILESYSTEM
+//#define MONGOOSE_NO_DIRECTORY_LISTING
 #define MONGOOSE_NO_CGI
 #define MONGOOSE_NO_WEBSOCKET
 #define MONGOOSE_NO_SSI
 #define MONGOOSE_NO_DAV
 #define MONGOOSE_NO_POPEN
 #define MONGOOSE_NO_MMAP
-
-#define NS_ENABLE_SSL
-#define NS_ENABLE_IPV6
 
 #ifdef NOEMBED_NET_SKELETON
 #include "net_skeleton.h"

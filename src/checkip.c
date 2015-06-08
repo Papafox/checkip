@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pwd.h>
@@ -14,11 +15,16 @@
 #include <signal.h>
 #include <time.h>
 #include <math.h>
-#include <pcre.h>
 
 #include "mongoose.h"
 #include "pidfile.h"
 #include "checkip.h"
+#include "netif_addr.h"
+#include "validip.h"
+#include "log_msg.h"
+
+static char ipAddr[16];
+
 
 static bool isLogable(struct mg_connection *conn) {
     uint32_t first_addr = 0x42f94001;		// 66.249.64.1
@@ -42,18 +48,6 @@ static void logGoogle(struct mg_connection *conn) {
     }
  }
 
-static void log_msg(int daemon_mode, const char *format, ...)
-{
-    va_list vl;
-
-    va_start(vl, format);
-    if(daemon_mode)
-       vsyslog(LOG_INFO, format, vl);
-    else
-       vprintf(format, vl);
-    va_end(vl);
-}
-
 static const char* getHeader(struct mg_connection *conn, const char* name) {
     int i;
     int size = sizeof(conn->http_headers)/sizeof(conn->http_headers[0]);
@@ -66,28 +60,16 @@ static const char* getHeader(struct mg_connection *conn, const char* name) {
     return (char*) NULL;
 }
 
-static int updateCnt(const char* uri, struct ValidIP* ip, int rc) {
-    int count = ip->count;
-
-    if (rc == 200) {
-      if (count > 0) count--;
-    } else {
-      if (count > -1) {
-        count += (strstr(uri, "://") == NULL) ? 2 : 10;
-      }
-      // don't increment count for favicon.ico
-      count -= (strcmp(uri, "/favicon.ico") == 0) ? 2 : 0;
-    }
-    return count;
-}
-
 static bool isValidReq(struct mg_connection *conn) {
+    // Allow references to /robot.txt
+    if (strcmp(conn->uri, "/robots.txt")) return TRUE;
+
     // Check that method is GET
     if (!strcmp(conn->request_method, "GET") == 0) return FALSE;
 
     // Check that it's directed to this host
     const char* host = getHeader(conn, "Host");
-    if (host == NULL || strcasecmp(host, HOSTNAME) != 0) return FALSE;
+    if (host != NULL && !(strcasecmp(host, HOSTNAME) == 0 || strcmp(host, ipAddr) == 0)) return FALSE;
 
     // Check that there is NO referer
     const char* referer = getHeader(conn, "Referer");
@@ -112,8 +94,9 @@ static void checkip_req(struct mg_connection *conn) {
     send_headers(conn);
 
     // Return the remote ipaddr
-    char resp[200];
-    snprintf(resp, 200, "<html><head><meta name=\"robots\" content=\"noindex\"/><title>Current IP Check</title></head><body>Current IP Address: %s</body></html>", conn->remote_ip);
+    char resp[500];
+    char* location = "unknown";
+    snprintf(resp, sizeof(resp), "<html><head><meta name=\"robots\" content=\"noindex\"/><title>Current IP Check</title></head><body>Current IP Address: %s<br/>Geography: %s<br/><br/>This product includes GeoLite2 data created by MaxMind, available from <a href=\"http://www.maxmind.com\">http://www.maxmind.com</a></body></html>", conn->remote_ip, location);
     int len = strlen(resp);
     char lenStr[10];
     snprintf(lenStr, 10, "%d", len);
@@ -129,19 +112,51 @@ static void reject_req(struct mg_connection *conn) {
     char* resp = (strstr(conn->uri, "://") == NULL)?
                     "<html><head><title>Page not found</title></head><body><p>This page you requested '%s' does not exist</p></body></html>"
                :    "<html><head><title>This is not a proxy</title></head><body><p>This is not an open proxy. Your IP address %s has been banned</p></body></html>";
+
     // Compute a message len and return a Content-Length header
-    int len = strlen(resp);
     char lenStr[10];
+    mg_send_header(conn, "Content-Language", "en");
+    int len = strlen(resp);
     snprintf(lenStr, 10, "%d", len);
     mg_send_header(conn, "Content-Length", lenStr);
 
     // Return the rejection message
     mg_printf_data(conn, resp, conn->uri);
 }
+static void banIP(struct ValidIP* ip, const char* ipaddr) {
+    // Update the statistics
+    markBanned(ip);
+
+    // Fork child process to run iptables
+    log_msg(daemon_mode, "IP address %s banned", ipaddr);
+    int process_id = fork();
+    if (process_id < 0) {
+        log_msg(daemon_mode, "iptables fork() failed! - exiting");
+        exit(-1);
+    }
+
+    // (parent) Make sure WAIT for child, otherwise zombie process
+    if (process_id != 0) {
+        int status;
+        int wait = waitpid(process_id, &status, WUNTRACED | WCONTINUED);
+        if (wait < 0) {
+            log_msg(daemon_mode, "iptables waitpid() failed! - exiting");
+            exit(-1);
+        }
+        return;
+    }
+
+    // (child) Run iptables
+    int rc = execl("/sbin/iptables", "iptables", "-I", "INPUT", "-s", ipaddr, "-j", "DROP", (char *)0);
+    if (rc != 0)
+       log_msg(daemon_mode, "iptables exec() failed (ip = %s rc = %d, errno = %d err = '%s')", ipaddr, rc, errno, strerror(rc));
+    exit(0);
+}
 
 static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
   int result = 404;
   struct ValidIP* ip;
+  bool valid = FALSE;
 
   switch (ev) {
     case MG_AUTH: return MG_TRUE;
@@ -156,20 +171,21 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
       ip = findIP(conn->remote_ip);
 
       // validate and process
-      if (isValidReq(conn)) {
-        if (strcmp(conn->uri, "/") == 0) {
+      valid = isValidReq(conn);
+      if (valid && strcmp(conn->uri, "/") == 0) {
           checkip_req(conn);
           result = 200;
-        }
-//      if (strncmp(conn->uri, "/ping") == 0) {
-//        ping_req(conn);
-//        result = 200;
-//      }
-      } else
-        reject_req(conn);
+      }
+
+      if (!valid) {
+         result = 404;
+         if (strcmp(conn->uri, "/robots.txt") == 0)
+	    result = 200;
+         reject_req(conn);
+      }
 
       // update the ban count and possibly ban the ip addr
-      ip->count = updateCnt(conn->uri, ip, result);
+      updateCnt(conn->uri, ip, result);
 
       // log the request to syslog
       log_msg(daemon_mode, "[%d] %s: %s '%s%s%s' %d count=%d",
@@ -192,110 +208,6 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
     default:
       return MG_FALSE;
   }
-}
-
-static void initValidIP() {
-    int i;
-    for(i = 0; i < SIZE; i++) {
-      struct ValidIP* curr = &knownIP[i];
-      curr->ipAddr = 0xffffffff;
-      curr->count = -1;
-    }
-    knownCnt = 0;
-}
-
-static struct ValidIP* findIP(const char* remote_ip) {
-    int i;
-    uint32_t ipaddr = parseIPV4string(remote_ip);
-
-    // Search for an existing entry
-    for(i = 0; i < SIZE; i++) {
-      struct ValidIP* curr = &knownIP[i];
-      if (curr->ipAddr == ipaddr && curr->count != -1)
-         return curr;
-    }
-
-    // Add a new entry (first unused)
-    for(i = 0; i < SIZE; i++) {
-      struct ValidIP* curr = &knownIP[i];
-      if (curr->ipAddr == 0xffffffff) {
-         curr->ipAddr = ipaddr;
-         curr->count = 0;
-         knownCnt++;
-         log_msg(daemon_mode, "IP addr %s added to validIP table (count = %d)", remote_ip, knownCnt);
-         return curr;
-      }
-    }
-
-    return (struct ValidIP*)NULL;
-}
-
-static uint32_t parseIPV4string(const char* ipAddress) {
-    const char* regexStr = "(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)";
-    const char* error;
-    int   errOffset;
-    int   match[30];
-
-    int buf[4];
-    const char* matchStr;
-
-    pcre* regex = pcre_compile(regexStr, 0, &error, &errOffset, NULL);
-    if (regex == NULL) {
-      log_msg(daemon_mode, "regex compile failed (%s) - exiting", error);
-      exit(-1);
-    }
-
-    pcre_extra* regexOpt = pcre_study(regex, 0, &error);
-    if (regexOpt == NULL) {
-      log_msg(daemon_mode, "regex optimise failed (%s) - exiting", error);
-      exit(-1);
-    }
-
-    int ret = pcre_exec(regex, regexOpt, ipAddress, strlen(ipAddress), 0, 0, match, sizeof(match)/sizeof(match[0]));
-    if(ret < 0) { 	// Something bad happened..
-      switch(ret) {
-        case PCRE_ERROR_NOMATCH      : error = "String did not match the pattern";        break;
-        case PCRE_ERROR_NULL         : error = "Something was null";                      break;
-        case PCRE_ERROR_BADOPTION    : error = "A bad option was passed";                 break;
-        case PCRE_ERROR_BADMAGIC     : error = "Magic number bad (compiled re corrupt?)"; break;
-        case PCRE_ERROR_UNKNOWN_NODE : error = "Something kooky in the compiled RE";      break;
-        case PCRE_ERROR_NOMEMORY     : error = "Ran out of memory";                       break;
-        default                      : error = "Unknown error";                           break;
-      }
-      log_msg(daemon_mode, "regex exec error %d (%s) - exiting", ret, error);
-      exit(-1);
-    }
-
-    if (ret != 5) {	// Wrong num of matches
-      if (ret == 0) ret = sizeof(match)/sizeof(match[0]);
-      log_msg(daemon_mode, "regex matched %d instead of 4 strings - exiting", ret);
-      exit(-1);
-    }
-
-    int i;
-    for (i = 0; i < 4; i++) {
-      pcre_get_substring(ipAddress, match, ret, i+1, &(matchStr));
-      buf[i] = atoi(matchStr);
-    }
-
-    return buf[0] << 24 | buf[1] << 16 | buf[2] << 8 | buf[3];
-}
-
-static void banIP(struct ValidIP* ip, const char* ipaddr) {
-    ip->count = -1;
-    ip->ipAddr = 0xffffffff;
-    knownCnt--;
-
-    log_msg(daemon_mode, "IP address %s banned - '%s'", ipaddr);
-//    int process_id = fork();
-//    if (process_id < 0) {
-//        log_msg(daemon_mode, "iptables fork() failed! - exiting");
-//    }
-//    if (process_id != 0)
-//        return;
-//    int rc = execl("/sbin/iptables", "-I", "-s", ipaddr, "-j", "DROP", (char *)0);
-//    log_msg(daemon_mode, "iptables exec() failed (ip = %s rc = %d, errno = %d err = '%s')", ipaddr, rc, errno, strerror(rc));
-//    exit(0);
 }
 
 static void redir2null(FILE* oldfile, int oflags) {
@@ -341,6 +253,10 @@ static void usage(void) {
            "\t-p nnn is the port to listen to\n\t-u <userid> is the userid the server will execute under\n");
 }
 
+static const char* getIPaddr(void) {
+    return netif_addr("eth0");
+}
+
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 static void intHandler(int dummy) {
     running = 0;
@@ -350,7 +266,7 @@ int main(int argc, char** argv) {
     struct mg_server *server;
     char  buf[100];
     const char* pidFile = "/var/run/checkip.pid";
-    char* port = "80,ssl://0.0.0.0:443:checkip-cert.pem";
+    char port[80];
     char* user = "nobody";
     int jail_mode = FALSE;
     char* jail_root = NULL;
@@ -361,6 +277,13 @@ int main(int argc, char** argv) {
     pid_t process_id = 0;
     pid_t sid = 0;
     daemon_mode = FALSE;
+
+    strcpy(ipAddr, getIPaddr());
+//  strcpy(port, "80,ssl://");
+//  strcat(port, ipAddr);
+//  strcat(port, ":443:checkip-cert.pem");
+    strcpy(port, "80,ssl://0.0.0.0:443:checkip-cert.pem");
+
     initValidIP();
 
     // Get the start time
@@ -381,7 +304,7 @@ int main(int argc, char** argv) {
                 }
                 jail_root = realpath(temp_dir, NULL);
                 break;
-      case 'p': port = optarg;
+      case 'p': strcpy(port, optarg);
                 break;
       case 'u': user = optarg;
                 if (!user_exists(user)) {
@@ -446,6 +369,7 @@ int main(int argc, char** argv) {
     log_msg(daemon_mode, "CheckIP version %s starting", VERSION);
     server = mg_create_server(NULL, ev_handler);
     mg_set_option(server, "listening_port", port);
+    strcpy(buf, mg_get_option(server, "listening_port"));
     if (buf[0] == '\0') {
        log_msg(daemon_mode, "open listening ports failed - exiting");
        goto exit;
@@ -474,12 +398,12 @@ int main(int argc, char** argv) {
     mg_set_option(server, "run_as_user", user);
     if (user != NULL)
       log_msg(daemon_mode, "Server executing as user '%s'", user);
-    strcpy(buf, mg_get_option(server, "listening_port"));
     log_msg(daemon_mode, "Listening on port %s", buf);
 
     while (running) {
       mg_poll_server(server, 250);
     }
+    if(!daemon_mode) printf("\n");
 
     // Get the finish time and compute the duration
 exit:
@@ -495,6 +419,10 @@ exit:
     if (jail_root != NULL) free(jail_root);
     mg_destroy_server(&server);
     log_msg(daemon_mode, "Checkip stopping after %lu:%02lu:%02lu", hours, mins, secs);
+
+    // Print stats
+    print_stats(daemon_mode);
+
     if (!daemon_mode) printf("\nClean shutdown\n");
 
     return 0;

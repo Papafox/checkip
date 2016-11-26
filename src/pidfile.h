@@ -20,7 +20,7 @@
 #define CPF_CLOEXEC 1
 
 int createPidFile(const char *progName, const char *pidFile, int flags);
-
+void updateChildPid(int fd, long childPid);
 int lockRegion(int fd, int type, int whence, int start, int len);
 
 #endif

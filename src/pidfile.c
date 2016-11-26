@@ -66,7 +66,7 @@ int
 createPidFile(const char *progName, const char *pidFile, int flags)
 {
     int fd;
-    char buf[BUF_SIZE];
+//    char buf[BUF_SIZE];
 
     fd = open(pidFile, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
     if (fd == -1)
@@ -102,11 +102,25 @@ createPidFile(const char *progName, const char *pidFile, int flags)
     if (ftruncate(fd, 0) == -1)
         errExit("Could not truncate PID file '%s'", pidFile);
 
-    snprintf(buf, BUF_SIZE, "%ld\n", (long) getpid());
-    if (write(fd, buf, strlen(buf)) != strlen(buf))
-        fatal("Writing to PID file '%s'", pidFile);
+//    snprintf(buf, BUF_SIZE, "%ld\n", (long) getpid());
+//    if (write(fd, buf, strlen(buf)) != strlen(buf))
+//        fatal("Writing to PID file '%s'", pidFile);
 
     return fd;
+}
+
+void
+updateChildPid(int fd, long childPid) {
+    char buf[BUF_SIZE];
+
+    snprintf(buf, BUF_SIZE, "%ld\n", childPid);
+    if (ftruncate(fd, 0L) != 0)
+       fatal("Error truncating PID file");
+    lseek(fd, 0L, SEEK_SET);
+    if (write(fd, buf, strlen(buf)) != strlen(buf)) {
+       fatal("Error updating PID file");
+    }
+    return;
 }
 
 /* Lock a file region (private; public interfaces below) */

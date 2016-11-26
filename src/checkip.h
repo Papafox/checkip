@@ -13,8 +13,8 @@
 
 #define TRUE	1
 #define FALSE	0
-#define VERSION "1.60"
-#define HOSTNAME "vpn.wsadmin.org"
+#define VERSION "2.30"
+#define HOSTNAME "checkip.wsadmin.org"
 
 typedef int bool;
 
@@ -23,14 +23,13 @@ static void logGoogle(struct mg_connection *conn);
 static const char* getHeader(struct mg_connection *conn, const char* name);
 static bool isValidReq(struct mg_connection *conn);
 static void checkip_req(struct mg_connection *conn);
-static void reject_req(struct mg_connection *conn);
+static void checkip_robots(struct mg_connection *conn);
+static void reject_req(struct mg_connection *conn, int result);
 static int ev_handler(struct mg_connection *conn, enum mg_event ev);
 static void usage();
 static void intHandler(int dummy);
 static void redir2null(FILE* oldfile, int oflags);
 static bool dir_exists(const char* dir);
 static bool user_exists(const char* userid);
-
-int running;			// Boolean set false on shutdown
 
 #endif

@@ -1,10 +1,8 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <limits.h>
+#include <math.h>
 #include <pwd.h>
 #include <string.h>
 #include <stdlib.h>
@@ -13,8 +11,11 @@
 #include <syslog.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
 #include <time.h>
-#include <math.h>
+#include <unistd.h>
 
 #include "mongoose.h"
 #include "pidfile.h"
@@ -22,21 +23,26 @@
 #include "netif_addr.h"
 #include "validip.h"
 #include "log_msg.h"
+#include "geoip.h"
 
 static char ipAddr[16];
-
+static char robots[500];
+static char sitemap[500];
+static char jailDir[500];
+static time_t start, finish;		// daemon start and end timestamps
+static int running;			// Boolean set false on shutdown
+static const char* acme_header = "/.well-known/acme-challenge";
+static char letsencrypt_req[500];
+static char letsencrypt_resp[500];
 
 static bool isLogable(struct mg_connection *conn) {
-    uint32_t first_addr = 0x42f94001;		// 66.249.64.1
-    uint32_t last_addr = 0x42f95ffe;		// 66.249.95.254
-
-    const char* remote_ip = conn->remote_ip;
     const char* referer = getHeader(conn, "Referer");
     const char* host = getHeader(conn, "Host");
-    uint32_t ip = parseIPV4string(remote_ip);
+    //const char* remote_ip = conn->remote_ip;
+    //uint32_t ip = parseIPV4string(remote_ip);
 
-    bool result = (host == NULL || referer != NULL) && strcmp(conn->uri,"/favicon.ico") != 0;
-    result |= ip >= first_addr && ip <= last_addr;
+    bool result = (host == NULL || referer != NULL);
+    if (strcmp(conn->uri,"/favicon.ico") == 0) result = FALSE;
     return result;
 }
 
@@ -60,16 +66,19 @@ static const char* getHeader(struct mg_connection *conn, const char* name) {
     return (char*) NULL;
 }
 
-static bool isValidReq(struct mg_connection *conn) {
-    // Allow references to /robot.txt
-    if (strcmp(conn->uri, "/robots.txt")) return TRUE;
+static bool isValidMethod(struct mg_connection *conn) {
+    return (strcmp(conn->request_method, "GET") == 0);
+}
 
-    // Check that method is GET
-    if (!strcmp(conn->request_method, "GET") == 0) return FALSE;
+static bool isValidReq(struct mg_connection *conn) {
+    // Allow references to /robot.txt and /sitemap.xml
+    if (strcmp(conn->uri, "/robots.txt") == 0) return TRUE;
+    if (strcmp(conn->uri, "/sitemap.xml") == 0) return TRUE;
+    if (strncmp(conn->uri, acme_header, strlen(acme_header)) == 0) return TRUE;
 
     // Check that it's directed to this host
-    const char* host = getHeader(conn, "Host");
-    if (host != NULL && !(strcasecmp(host, HOSTNAME) == 0 || strcmp(host, ipAddr) == 0)) return FALSE;
+//  const char* host = getHeader(conn, "Host");
+//  if (host != NULL && !(strcasecmp(host, HOSTNAME) == 0 || strcmp(host, ipAddr) == 0)) return FALSE;
 
     // Check that there is NO referer
     const char* referer = getHeader(conn, "Referer");
@@ -85,9 +94,53 @@ static void send_headers(struct mg_connection *conn) {
     // Prevent proxies and browsers from caching response, also include some security headers
     mg_send_header(conn, "Cache-Control", "max-age=0, post-check=0, pre-check=0, no-store, no-cache, must-revalidate");
     mg_send_header(conn, "Pragma", "no-cache");
+    mg_send_header(conn, "Host", HOSTNAME);
     mg_send_header(conn, "Content-Type", "text/html; charset=utf8");
     mg_send_header(conn, "X-Frame-Options", "DENY");
     mg_send_header(conn, "Server", "wsadmin-CheckIP/" VERSION);
+}
+
+static void checkip_letsencrypt(struct mg_connection *conn) {
+    const char* remote_ip = conn->remote_ip;
+
+    mg_send_header(conn, "Host", HOSTNAME);
+    mg_send_header(conn, "Server", "wsadmin-CheckIP/" VERSION);
+    mg_send_header(conn, "Content-Type", "text/plain; charset=ascii");
+    if (strcmp(conn->uri, letsencrypt_req) == 0) {
+        char lenStr[10];
+
+        snprintf(lenStr, 10, "%d", strlen(letsencrypt_resp));
+        mg_send_header(conn, "Content-Length", lenStr);
+        mg_printf_data(conn, letsencrypt_resp);
+        log_msg(daemon_mode, "letsencrypt challenge received from %s response '%s'", remote_ip, letsencrypt_resp);
+    } else {
+        char *resp = "** Invalid LetsEncrypt Challenge **\r\nExpected: '%s'\r\nReceived: '%s'\r\n";
+        char buff[500];
+        char lenStr[10];
+
+        snprintf(buff, 500, resp, letsencrypt_req, conn->uri);
+        mg_send_status(conn, 404);
+        snprintf(lenStr, 10, "%d", strlen(buff));
+        mg_send_header(conn, "Content-Length", lenStr);
+        mg_printf_data(conn, buff);
+        log_msg(daemon_mode, "incorrect letsencrypt challenge received from %s", remote_ip);
+        log_msg(daemon_mode, "received '%s', expected '%s'", conn->uri, letsencrypt_req);
+    }
+}
+
+static void checkip_robots(struct mg_connection *conn) {
+    const char* remote_ip = conn->remote_ip;
+    send_headers(conn);
+    mg_printf_data(conn, robots);
+    updateRobot();
+    log_msg(daemon_mode, "robots.txt sent to %s", remote_ip);
+}
+
+static void checkip_sitemap(struct mg_connection *conn) {
+    const char* remote_ip = conn->remote_ip;
+    send_headers(conn);
+    mg_printf_data(conn, sitemap);
+    log_msg(daemon_mode, "sitemap.xml sent to %s", remote_ip);
 }
 
 static void checkip_req(struct mg_connection *conn) {
@@ -95,8 +148,13 @@ static void checkip_req(struct mg_connection *conn) {
 
     // Return the remote ipaddr
     char resp[500];
-    char* location = "unknown";
-    snprintf(resp, sizeof(resp), "<html><head><meta name=\"robots\" content=\"noindex\"/><title>Current IP Check</title></head><body>Current IP Address: %s<br/>Geography: %s<br/><br/>This product includes GeoLite2 data created by MaxMind, available from <a href=\"http://www.maxmind.com\">http://www.maxmind.com</a></body></html>", conn->remote_ip, location);
+    char* location;
+
+    location = (char*)malloc(500);
+    lookupCountry(conn->remote_ip, &location, sizeof(location));
+    //log_msg(daemon_mode, "IP addr = %s Location = %s", conn->remote_ip, location);
+    //strcpy(location, "unknown");
+    snprintf(resp, sizeof(resp), "<html><head><meta name=\"google-site-verification\" content=\"sdVLgoSVNvwkjzJEwKUVFlbBuQY-n2HBoUzlHPBWGN8\" /><title>Current IP Check</title></head><body>Current IP Address: %s<br/>Geography: %s<br/><br/>This product includes GeoLite2 data created by MaxMind, available from <a href=\"http://www.maxmind.com\">http://www.maxmind.com</a></body></html>", conn->remote_ip, location);
     int len = strlen(resp);
     char lenStr[10];
     snprintf(lenStr, 10, "%d", len);
@@ -105,13 +163,21 @@ static void checkip_req(struct mg_connection *conn) {
     mg_printf_data(conn, resp);
 }
 
-static void reject_req(struct mg_connection *conn) {
+static void reject_req(struct mg_connection *conn, int result) {
+    char resp[500];
     send_headers(conn);
 
     // Return a please go away message
-    char* resp = (strstr(conn->uri, "://") == NULL)?
-                    "<html><head><title>Page not found</title></head><body><p>This page you requested '%s' does not exist</p></body></html>"
-               :    "<html><head><title>This is not a proxy</title></head><body><p>This is not an open proxy. Your IP address %s has been banned</p></body></html>";
+    snprintf(resp, sizeof(resp), ((strstr(conn->uri, "://") == NULL)?
+                    "<html><head><meta name='google-site-verification' content='sdVLgoSVNvwkjzJEwKUVFlbBuQY-n2HBoUzlHPBWGN8' /><title>Page not found</title></head><body><p>This page you requested '%s' does not exist</p></body></html>"
+               :    "<html><head><meta name='google-site-verification' content='sdVLgoSVNvwkjzJEwKUVFlbBuQY-n2HBoUzlHPBWGN8' /><title>This is not a proxy</title></head><body><p>This is not an open proxy. Your IP address %s has been banned</p></body></html>"), conn->remote_ip);
+
+    // Handle invalid method
+    if (result == 501)
+       snprintf(resp, sizeof(resp), "<html><head><title>No Supported</title></head><body><h1>501 Not Supported</h1><p>Method '%s' is not supported by this server</p></body></html>", conn->request_method);
+
+    // Send result
+    mg_send_status(conn, result);
 
     // Compute a message len and return a Content-Length header
     char lenStr[10];
@@ -123,12 +189,18 @@ static void reject_req(struct mg_connection *conn) {
     // Return the rejection message
     mg_printf_data(conn, resp, conn->uri);
 }
+
 static void banIP(struct ValidIP* ip, const char* ipaddr) {
     // Update the statistics
     markBanned(ip);
 
+    // Has this IP been banned in the past?
+    char *msg = "IP address %s banned";
+    if (ip->banned > 1)
+       msg = "IP Address %s banned %d times";
+    log_msg(daemon_mode, msg, ipaddr, ip->banned);
+
     // Fork child process to run iptables
-    log_msg(daemon_mode, "IP address %s banned", ipaddr);
     int process_id = fork();
     if (process_id < 0) {
         log_msg(daemon_mode, "iptables fork() failed! - exiting");
@@ -146,10 +218,11 @@ static void banIP(struct ValidIP* ip, const char* ipaddr) {
         return;
     }
 
-    // (child) Run iptables
-    int rc = execl("/sbin/iptables", "iptables", "-I", "INPUT", "-s", ipaddr, "-j", "DROP", (char *)0);
+    // (child) Add IP address to iptables "checkip" set
+    int rc = (ip->banned <= 1) ? execl("/sbin/ipset", "ipset", "add", "checkip", ipaddr, (char *)0)
+			       : execl("/sbin/ipset", "ipset", "add", "checkip", ipaddr, "timeout", "0", (char *)0);
     if (rc != 0)
-       log_msg(daemon_mode, "iptables exec() failed (ip = %s rc = %d, errno = %d err = '%s')", ipaddr, rc, errno, strerror(rc));
+       log_msg(daemon_mode, "ipset exec() failed (ip = %s rc = %d, errno = %d err = '%s')", ipaddr, rc, errno, strerror(errno));
     exit(0);
 }
 
@@ -162,45 +235,73 @@ static int ev_handler(struct mg_connection *conn, enum mg_event ev) {
     case MG_AUTH: return MG_TRUE;
 
     case MG_REQUEST:
+
       // Log all headers for request if from Google
       // has a referer
       if (isLogable(conn))
-        logGoogle(conn);
+         logGoogle(conn);
 
       // Get validIP entry.  Add new entry if necessary
       ip = findIP(conn->remote_ip);
+      if (ip != NULL)
+         updateCnt(ip);
 
       // validate and process
-      valid = isValidReq(conn);
-      if (valid && strcmp(conn->uri, "/") == 0) {
-          checkip_req(conn);
-          result = 200;
+      valid = FALSE;
+      result = 501;
+      if (ip != NULL && (ip->banned == 0) && isValidMethod(conn)) {
+         result = 404;
+         valid = isValidReq(conn);
+
+         // Handle Letsencrypt challenge
+         if ((letsencrypt_req[0] != '\0') && strncmp(conn->uri, acme_header, strlen(acme_header)) == 0) {
+             valid = TRUE;
+             checkip_letsencrypt(conn);
+             result = 200;
+         }
+
+         // Handle general cases
+         if (valid && strcmp(conn->uri, "/") == 0) {
+             checkip_req(conn);
+             result = 200;
+         }
+         if (valid && strcmp(conn->uri, "/robots.txt") == 0) {
+             checkip_robots(conn);
+             result = 200;
+         }
+         if (valid && strcmp(conn->uri, "/sitemap.xml") == 0) {
+             checkip_sitemap(conn);
+             result = 200;
+         }
+         if (valid && strcmp(conn->uri, "/googled01a3874d935c921.html") == 0) {
+             valid = FALSE;
+             result = 200;
+         }
       }
 
       if (!valid) {
-         result = 404;
-         if (strcmp(conn->uri, "/robots.txt") == 0)
-	    result = 200;
-         reject_req(conn);
+         reject_req(conn, result);
       }
 
       // update the ban count and possibly ban the ip addr
-      updateCnt(conn->uri, ip, result);
+      updateScore(conn->uri, ip, result);
 
       // log the request to syslog
-      log_msg(daemon_mode, "[%d] %s: %s '%s%s%s' %d count=%d",
-						   conn->local_port,
-						   conn->remote_ip,
-						   conn->request_method,
-						   conn->uri,
-						   ((conn->query_string == NULL) ? "" : "?"),
-						   ((conn->query_string == NULL) ? "" : conn->query_string),
-						   result,
-						   ip->count
-      );
+      if (ip->score > 0 || strcmp(conn->uri, "/") != 0) {
+		  log_msg(daemon_mode, "[%d] %s: %s '%s%s%s' %d score=%d",
+							   conn->local_port,
+							   conn->remote_ip,
+							   conn->request_method,
+							   conn->uri,
+							   ((conn->query_string == NULL) ? "" : "?"),
+							   ((conn->query_string == NULL) ? "" : conn->query_string),
+							   result,
+							   ip->score
+		  );
+      }
 
       // if necessary, ban the IP address
-      if (ip->count >= LIMIT || strcmp(conn->request_method, "GET") != 0) {
+      if (ip->score >= LIMIT || strcmp(conn->request_method, "GET") != 0) {
         banIP(ip, conn->remote_ip);
       }
       return (result == 200) ? MG_TRUE : MG_FALSE;
@@ -248,61 +349,156 @@ static bool isChrooted(void) {
 }
 
 static void usage(void) {
-    printf("Usage: checkip -d -j -p nnn -u <userid>\nwhere\t-d\trun in daemon mode, logging to syslog\n"
-           "\t-j <dir> run the server in a chroot jail - requires -d\n"
-           "\t-p nnn is the port to listen to\n\t-u <userid> is the userid the server will execute under\n");
+    printf("Usage: checkip -d -j -p nnn -u <userid> -c <file>\nwhere"
+           "\t-d\t\trun in daemon mode, logging to syslog\n"
+           "\t-j <dir>\trun the server in a chroot jail - requires -d\n"
+           "\t-p nnn\t\tis the port to listen to\n"
+           "\t-u <userid>\tis the userid the server will execute under\n"
+           "\t-c <file>\tis the SSL server certificate to use - must include both the cert and the private key\n"
+           "\t-r <uri>\tis the LetEncrypt challenge URI\n"
+           "\t-R \"xxx\"\tis the LetsEncrypt response string when the LetEncrypt challend URI is received\n");
 }
 
 static const char* getIPaddr(void) {
     return netif_addr("eth0");
 }
 
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-static void intHandler(int dummy) {
-    running = 0;
+// Load the robots.txt file into a static variable 'robots'
+static void loadRobots(const char* rootDir) {
+	const char* fname = realpath("./robots.txt", NULL);
+	struct stat st;
+
+	if (fname == NULL) {
+		char pwd[500];
+		getcwd(pwd, sizeof(pwd));
+		log_msg(daemon_mode, "Robots file '%s' does not exist (curr dir = %s)\n", fname, pwd);
+		exit(-1);
+	}
+	int fd = open(fname, O_RDONLY);
+	if (fd == -1) {
+		log_msg(daemon_mode, "Robots file '%s' open failed: error %d\n", fname, errno);
+		exit(-1);
+	}
+	fstat(fd, &st);
+	if (st.st_size >= (long)sizeof(robots)) {
+		log_msg(daemon_mode, "Robots file '%s' has a size of %ld and is too long\n", fname, st.st_size);
+		exit(-1);
+	}
+
+	read(fd, robots, sizeof(robots));
+	close(fd);
+	log_msg(daemon_mode, "Robots file '%s%s' loaded", rootDir, fname);
+}
+
+static void loadSitemap(const char* rootDir) {
+	const char* fname = realpath("./sitemap.xml", NULL);
+	struct stat st;
+
+	if (fname == NULL) {
+		char pwd[500];
+		getcwd(pwd, sizeof(pwd));
+		log_msg(daemon_mode, "Sitemap file '%s' does not exist (curr dir = %s)\n", fname, pwd);
+		exit(-1);
+	}
+	int fd = open(fname, O_RDONLY);
+	if (fd == -1) {
+		log_msg(daemon_mode, "Sitemap file '%s' open failed: error %d\n", fname, errno);
+		exit(-1);
+	}
+	fstat(fd, &st);
+	if (st.st_size >= (long)sizeof(sitemap)) {
+		log_msg(daemon_mode, "Sitemap file '%s' has a size of %ld and is too long\n", fname, st.st_size);
+		exit(-1);
+	}
+
+	read(fd, sitemap, sizeof(sitemap));
+	close(fd);
+	log_msg(daemon_mode, "Sitemap file '%s%s' loaded", rootDir, fname);
+}
+
+#pragma GCC diagnostic ignored "-Wunused-function"
+static void printTZ(void) {
+	time_t t = time(NULL);
+	struct tm lt = {0};
+	char time[30];
+	const char* TZ = getenv("TZ");
+
+	localtime_r(&t, &lt);
+	strftime(time, sizeof time, "%Z", &lt);
+  	log_msg(daemon_mode, "TZ = '%s' while the timezone is '%s'", ((TZ == NULL) ? "*unset*":TZ), time);
+	return;
+}
+
+// Signal handler
+//    HUP	print the stats
+//    INT	end server
+//    TERM	end server
+void intHandler(int signum) {
+    log_msg(daemon_mode, "Signal %s (%d) receieved", strsignal(signum), signum);
+    switch(signum) {
+    case SIGINT:
+         running = 0;
+         break;
+    case SIGTERM:
+         running = 0;
+         break;
+    case SIGHUP:
+    	 loadRobots(jailDir);
+    	 loadSitemap(jailDir);
+    	 time(&finish);
+	 printTZ();
+         print_stats(daemon_mode, start, finish, "running for");
+         break;
+    default:
+         break;
+    }
 }
 
 int main(int argc, char** argv) {
     struct mg_server *server;
     char  buf[100];
+    char  cert[100];
     const char* pidFile = "/var/run/checkip.pid";
-    char port[80];
+    char  port[140];
     char* user = "nobody";
     int jail_mode = FALSE;
-    char* jail_root = NULL;
     int c;
-    time_t start, finish;
+    int fd = -1;
 
     // init variables
     pid_t process_id = 0;
     pid_t sid = 0;
     daemon_mode = FALSE;
-
-    strcpy(ipAddr, getIPaddr());
-//  strcpy(port, "80,ssl://");
-//  strcat(port, ipAddr);
-//  strcat(port, ":443:checkip-cert.pem");
-    strcpy(port, "80,ssl://0.0.0.0:443:checkip-cert.pem");
+    letsencrypt_req[0] = '\0';
+    letsencrypt_resp[0] = '\0';
+    strncpy(cert, "checkip-cert.pem", sizeof cert);
 
     initValidIP();
+    jailDir[0] = '\0';
 
     // Get the start time
     time(&start);
 
     // Parse command line for "-h -p nnn -c /path/to/file"
-    while((c = getopt(argc, argv, "dhj:p:u:")) != -1)
+    while((c = getopt(argc, argv, "dhj:p:u:r:R:c:")) != -1)
     {
       switch(c)
       {
+      case 'c': strncpy(cert, optarg, sizeof cert);
+                break;
       case 'd': daemon_mode = TRUE;
                 break;
       case 'j': jail_mode = TRUE;
                 char* temp_dir = optarg;
                 if (!dir_exists(temp_dir)) {
-                  printf("Jail root dir '%s' does not exist, or is not a directory\n", jail_root);
+                  printf("Jail root dir '%s' does not exist, or is not a directory\n", jailDir);
                   return -1;
                 }
-                jail_root = realpath(temp_dir, NULL);
+                strncpy(jailDir, realpath(temp_dir, NULL), sizeof jailDir);
+                break;
+      case 'r': strcpy(letsencrypt_req, optarg);
+                break;
+      case 'R': strcpy(letsencrypt_resp, optarg);
                 break;
       case 'p': strcpy(port, optarg);
                 break;
@@ -328,13 +524,16 @@ int main(int argc, char** argv) {
       printf("-j (chroot jail) requires -d (daemon) by specified\n");
       return -1;
     }
+    strcpy(ipAddr, getIPaddr());
+    strcpy(port, "80,ssl://0.0.0.0:443:");
+    strncat(port, cert, (sizeof port)-strlen(port)-1);
 
     // Open the log
     if (daemon_mode)
       openlog(NULL, LOG_CONS | LOG_PID, LOG_DAEMON);
 
     // lock the pid file
-    createPidFile(argv[0], pidFile, 0);
+    fd = createPidFile(argv[0], pidFile, 0);
 
     // If a daemon, fork a child process and exit the parent
     if (daemon_mode) {
@@ -363,10 +562,15 @@ int main(int argc, char** argv) {
       redir2null(stdin, O_RDONLY);
       redir2null(stdout, O_WRONLY);
       redir2null(stderr, O_RDWR);	// Note stderr must be r/w
+
+      // 6. Update the PID file with the child PID
+      updateChildPid(fd, (long) getpid());
     }
 
     // Create and configure the server
     log_msg(daemon_mode, "CheckIP version %s starting", VERSION);
+    printTZ();
+    log_msg(daemon_mode, "Using SSL certificate '%s'", cert);
     server = mg_create_server(NULL, ev_handler);
     mg_set_option(server, "listening_port", port);
     strcpy(buf, mg_get_option(server, "listening_port"));
@@ -381,18 +585,38 @@ int main(int argc, char** argv) {
        putenv("PATH=/bin:/sbin");
 
        // set the new root dir
-       int err = chroot(jail_root);
+       int err = chroot(jailDir);
        if (err != 0) {
           log_msg(daemon_mode, "chroot() failed! (err %d) - exiting", errno);
           exit(-1);
        }
-       log_msg(daemon_mode, "Established chroot() jail under '%s'", jail_root);
+       log_msg(daemon_mode, "Established chroot() jail under '%s'", jailDir);
+
+       // Set the curr dir to be within the chroot
+       chdir("/");
     }
 
-    // Trap KILL's - cause 'running' flag to be set false
+    // Trap KILL's - cause 'running' flag to be set false, HUP dumps the stats
     running = -1;
     signal(SIGINT, intHandler);
     signal(SIGTERM, intHandler);
+    signal(SIGHUP, intHandler);
+
+    // load robots.txt to robots variable
+    loadRobots(jailDir);
+
+    // load sitemap.xml to robots variable
+    loadSitemap(jailDir);
+
+    // load the GeoIP database
+    initGeoIP();
+
+    // Log LetsEncrypt settings
+    if (letsencrypt_req[0] != '\0')
+        log_msg(daemon_mode, "LE req = '%s'\n", letsencrypt_req);
+    if (letsencrypt_resp[0] != '\0')
+        log_msg(daemon_mode, "LE resp = '%s'\n", letsencrypt_resp);
+
 
     // Serve request. Hit Ctrl-C or SIGTERM to terminate the program
     mg_set_option(server, "run_as_user", user);
@@ -408,20 +632,21 @@ int main(int argc, char** argv) {
     // Get the finish time and compute the duration
 exit:
     time(&finish);
-    double dur = difftime(finish, start);
-    long hours, mins, secs, t;
-    hours = dur/3600.00;
-    t  = fmod(dur,3600.00);
-    mins = t / 60;
-    secs = t % 60;
 
     // Cleanup, and free server instance
-    if (jail_root != NULL) free(jail_root);
     mg_destroy_server(&server);
-    log_msg(daemon_mode, "Checkip stopping after %lu:%02lu:%02lu", hours, mins, secs);
+
+    // Close and delete the pid file;
+    if (fd != -1) {
+    	close(fd);
+    	unlink(pidFile);
+    }
 
     // Print stats
-    print_stats(daemon_mode);
+    print_stats(daemon_mode, start, finish, "stopping after");
+
+    // Clean up GeoIP2
+    closeGeoIP();
 
     if (!daemon_mode) printf("\nClean shutdown\n");
 
